@@ -5,6 +5,7 @@ from io import BytesIO
 import zipfile
 import os
 import time
+import re
 
 # Try to import Google GenAI SDK, give actionable guidance if fails
 try:
@@ -80,7 +81,8 @@ def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt, 
     """
     Generates a side-by-side image using Gemini 2.5 Flash Image.
     Returns raw image bytes or None on failure.
-    This function now gracefully handles SDK versions that don't expose types.TextInput.
+    This function now gracefully handles SDK versions that don't expose types.TextInput,
+    and surfaces quota/429 errors with retry guidance.
     """
     full_prompt = (
         f"Generate a single wide image split into two side-by-side panels. "
@@ -95,16 +97,13 @@ def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt, 
     # Build contents in a version-tolerant way:
     used_typed_input = False
     try:
-        # Preferred: typed TextInput (may not exist in some SDK builds)
         TextInput = getattr(types, "TextInput", None)
         if TextInput:
             text_input = TextInput(text=full_prompt)
             used_typed_input = True
         else:
-            # If not present, fall back to a plain dict. Many SDK wrappers accept dicts.
             text_input = {"text": full_prompt}
     except Exception:
-        # If constructing the typed input raises for some reason, fallback to dict
         text_input = {"text": full_prompt}
 
     if debug:
@@ -167,7 +166,32 @@ def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt, 
         st.warning("No image data found in response. The request may have been blocked by safety filters or the SDK returned unexpected structure.")
         return None
 
-    except Exception:
+    except Exception as e:
+        # Special-case quota / ClientError to give actionable guidance
+        ClientError = getattr(genai.errors, "ClientError", None)
+        if ClientError and isinstance(e, ClientError):
+            # Attempt to parse retryDelay from error string or attributes
+            retry_secs = None
+            try:
+                # some SDK error messages include "retryDelay': '22s'" or "retryDelay": "22s"
+                m = re.search(r"retryDelay':\\s*'?(\\d+)s'?|\"retryDelay\":\\s*\"?(\\d+)s", str(e))
+                if m:
+                    retry_secs = int(m.group(1) or m.group(2))
+            except Exception:
+                retry_secs = None
+
+            st.error("Quota / rate limit error from Gemini API (RESOURCE_EXHAUSTED).")
+            if retry_secs:
+                st.info(f"Server suggests retry after ~{retry_secs} seconds.")
+            st.write("Possible fixes:")
+            st.write("- Enable billing for your Google Cloud project or upgrade your AI Studio plan.")
+            st.write("- Check and request quota increases: https://ai.google.dev/gemini-api/docs/rate-limits")
+            st.write("- Reduce request rate or number of images per run.")
+            if debug:
+                st.code(traceback.format_exc())
+            return None
+
+        # Generic fallback for other exceptions
         st.error("Error generating image via GenAI SDK. Full traceback:")
         st.code(traceback.format_exc())
         return None
