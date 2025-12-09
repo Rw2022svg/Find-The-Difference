@@ -71,6 +71,7 @@ def render_settings_modal():
 def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt):
     """
     Generates a side-by-side image using Gemini 2.5 Flash Image.
+    NOTE: request the IMAGE modality (response_modalities=["IMAGE"]) instead of setting response_mime_type.
     """
     full_prompt = (
         f"Generate a single wide image split into two side-by-side panels. "
@@ -83,19 +84,27 @@ def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt):
     )
 
     try:
+        # Request IMAGE modality (remove response_mime_type which the SDK may treat as a text-only mime)
         response = client.models.generate_content(
             model="gemini-2.5-flash-image",
-            contents=full_prompt,
+            # pass the prompt as a TextInput inside a list
+            contents=[types.TextInput(text=full_prompt)],
             config=types.GenerateContentConfig(
-                response_mime_type="image/png",
+                response_modalities=["IMAGE"],
                 candidate_count=1
             )
         )
 
-        if response.candidates and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if getattr(part, "inline_data", None):
-                    return part.inline_data.data  # raw bytes
+        # Navigate the response to find inline image bytes (keeps your existing parsing)
+        # Different SDK versions may structure response slightly differently; this matches earlier logic.
+        if getattr(response, "candidates", None):
+            candidate = response.candidates[0]
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None)
+            if parts:
+                for part in parts:
+                    if getattr(part, "inline_data", None):
+                        return part.inline_data.data  # raw bytes
 
         st.warning("No image data found in response.")
         return None
