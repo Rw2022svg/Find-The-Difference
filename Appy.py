@@ -20,14 +20,18 @@ if st.session_state["api_key"] == "":
 def open_settings_modal():
     st.session_state["show_settings_modal"] = True
 
-# -- SETTINGS MODAL --
+# -- SETTINGS MODAL (with fallback if st.modal isn't available) --
 def render_settings_modal():
     # Only render the modal when requested
     if not st.session_state.get("show_settings_modal", False):
         return
 
-    # Modal with a small form to collect/save API key
-    with st.modal("Settings — Gemini API Key"):
+    # Use st.modal when available; otherwise fall back to a container (no crash).
+    modal_ctx = getattr(st, "modal", None)
+
+    # The settings form body (shared between modal and fallback)
+    def settings_form_body():
+        # Use a named form to keep behavior consistent
         with st.form("settings_form"):
             key_input = st.text_input(
                 "Google AI Studio API Key",
@@ -38,18 +42,30 @@ def render_settings_modal():
             save_pressed = st.form_submit_button("Save")
             cancel_pressed = st.form_submit_button("Cancel")
 
-        if save_pressed:
-            st.session_state["api_key"] = key_input.strip()
-            st.session_state["show_settings_modal"] = False
-            # Rerun so UI reflects saved key immediately
-            st.experimental_rerun()
-        if cancel_pressed:
-            # If no API key exists after cancel, keep modal showing next run.
-            if not st.session_state.get("api_key"):
-                st.session_state["show_settings_modal"] = True
-            else:
+            if save_pressed:
+                st.session_state["api_key"] = key_input.strip()
                 st.session_state["show_settings_modal"] = False
-            st.experimental_rerun()
+                # Rerun so UI reflects saved key immediately
+                st.experimental_rerun()
+            if cancel_pressed:
+                # If no API key exists after cancel, keep modal showing next run.
+                if not st.session_state.get("api_key"):
+                    st.session_state["show_settings_modal"] = True
+                else:
+                    st.session_state["show_settings_modal"] = False
+                st.experimental_rerun()
+
+    if modal_ctx:
+        # Newer Streamlit: show a real modal
+        with modal_ctx("Settings — Gemini API Key"):
+            settings_form_body()
+    else:
+        # Older Streamlit: fallback to container so app doesn't crash.
+        # We render the same form inline with a small notice that it's not a modal.
+        with st.container():
+            st.info("Settings (modal not supported in this Streamlit version — using inline fallback)")
+            st.header("Settings — Gemini API Key")
+            settings_form_body()
 
 # -- HELPER FUNCTION: GEMINI GENERATION ---
 def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt):
@@ -117,7 +133,7 @@ def process_and_save_images(image_bytes, index, subject, output_folder):
         st.error(f"Error processing image: {e}")
         return None
 
-# -- STREAMLIT UI ---
+# -- STREAMLIT UI --
 st.set_page_config(page_title="Gemini 2.5 Diff Generator", layout="wide")
 
 # Sidebar: settings button + info
