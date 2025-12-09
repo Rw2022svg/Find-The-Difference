@@ -1,17 +1,34 @@
 import streamlit as st
-from google import genai
-from google.genai import types
+import traceback
 from PIL import Image
 from io import BytesIO
 import zipfile
 import os
 import time
 
-# -- SESSION STATE INITIALIZATION FOR SETTINGS/MODAL --
+# Try to import Google GenAI SDK, give actionable guidance if fails
+try:
+    from google import genai
+    from google.genai import types
+except Exception as e:
+    st.error(
+        "Could not import the Google GenAI SDK (google.genai).\n\n"
+        "If you haven't installed it, try one of these (depending on the package available):\n"
+        "  pip install google-genai\n"
+        "or\n"
+        "  pip install google-generativeai\n\n"
+        "Then restart Streamlit. Full import error:\n"
+    )
+    st.code(traceback.format_exc())
+    st.stop()
+
+# -- SESSION STATE INITIALIZATION FOR SETTINGS/MODAL/DEBUG --
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 if "show_settings_modal" not in st.session_state:
     st.session_state["show_settings_modal"] = False
+if "debug_mode" not in st.session_state:
+    st.session_state["debug_mode"] = False
 
 # Automatically show settings modal on start if no API key present
 if st.session_state["api_key"] == "":
@@ -22,16 +39,12 @@ def open_settings_modal():
 
 # -- SETTINGS MODAL (with fallback if st.modal isn't available) --
 def render_settings_modal():
-    # Only render the modal when requested
     if not st.session_state.get("show_settings_modal", False):
         return
 
-    # Use st.modal when available; otherwise fall back to a container (no crash).
     modal_ctx = getattr(st, "modal", None)
 
-    # The settings form body (shared between modal and fallback)
     def settings_form_body():
-        # Use a named form to keep behavior consistent
         with st.form("settings_form"):
             key_input = st.text_input(
                 "Google AI Studio API Key",
@@ -45,10 +58,8 @@ def render_settings_modal():
             if save_pressed:
                 st.session_state["api_key"] = key_input.strip()
                 st.session_state["show_settings_modal"] = False
-                # Rerun so UI reflects saved key immediately
                 st.experimental_rerun()
             if cancel_pressed:
-                # If no API key exists after cancel, keep modal showing next run.
                 if not st.session_state.get("api_key"):
                     st.session_state["show_settings_modal"] = True
                 else:
@@ -56,22 +67,20 @@ def render_settings_modal():
                 st.experimental_rerun()
 
     if modal_ctx:
-        # Newer Streamlit: show a real modal
         with modal_ctx("Settings — Gemini API Key"):
             settings_form_body()
     else:
-        # Older Streamlit: fallback to container so app doesn't crash.
-        # We render the same form inline with a small notice that it's not a modal.
         with st.container():
             st.info("Settings (modal not supported in this Streamlit version — using inline fallback)")
             st.header("Settings — Gemini API Key")
             settings_form_body()
 
 # -- HELPER FUNCTION: GEMINI GENERATION ---
-def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt):
+def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt, debug=False):
     """
     Generates a side-by-side image using Gemini 2.5 Flash Image.
-    NOTE: request the IMAGE modality (response_modalities=["IMAGE"]) instead of setting response_mime_type.
+    Returns raw image bytes or None on failure.
+    This function now gracefully handles SDK versions that don't expose types.TextInput.
     """
     full_prompt = (
         f"Generate a single wide image split into two side-by-side panels. "
@@ -83,20 +92,42 @@ def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt):
         f"Do not add text, labels, or borders between panels. High resolution."
     )
 
+    # Build contents in a version-tolerant way:
+    used_typed_input = False
     try:
-        # Request IMAGE modality (remove response_mime_type which the SDK may treat as a text-only mime)
+        # Preferred: typed TextInput (may not exist in some SDK builds)
+        TextInput = getattr(types, "TextInput", None)
+        if TextInput:
+            text_input = TextInput(text=full_prompt)
+            used_typed_input = True
+        else:
+            # If not present, fall back to a plain dict. Many SDK wrappers accept dicts.
+            text_input = {"text": full_prompt}
+    except Exception:
+        # If constructing the typed input raises for some reason, fallback to dict
+        text_input = {"text": full_prompt}
+
+    if debug:
+        st.write(f"Using typed TextInput: {bool(used_typed_input)}")
+
+    try:
         response = client.models.generate_content(
             model="gemini-2.5-flash-image",
-            # pass the prompt as a TextInput inside a list
-            contents=[types.TextInput(text=full_prompt)],
+            contents=[text_input],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
                 candidate_count=1
             )
         )
 
-        # Navigate the response to find inline image bytes (keeps your existing parsing)
-        # Different SDK versions may structure response slightly differently; this matches earlier logic.
+        if debug:
+            st.text("Raw SDK response (repr):")
+            try:
+                st.code(repr(response))
+            except Exception:
+                st.write("Unable to show full repr of response. See logs.")
+
+        # Try to find inline image bytes in several known shapes of responses
         if getattr(response, "candidates", None):
             candidate = response.candidates[0]
             content = getattr(candidate, "content", None)
@@ -106,18 +137,43 @@ def generate_difference_pair_gemini(client, subject, style_prompt, diff_prompt):
                     if getattr(part, "inline_data", None):
                         return part.inline_data.data  # raw bytes
 
-        st.warning("No image data found in response.")
+        # Defensive recursive search (covers unexpected SDK shapes)
+        def find_inline_bytes(obj):
+            if obj is None:
+                return None
+            if hasattr(obj, "inline_data") and getattr(obj.inline_data, "data", None):
+                return obj.inline_data.data
+            if isinstance(obj, (list, tuple)):
+                for v in obj:
+                    res = find_inline_bytes(v)
+                    if res:
+                        return res
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    res = find_inline_bytes(v)
+                    if res:
+                        return res
+            if hasattr(obj, "__dict__"):
+                for v in vars(obj).values():
+                    res = find_inline_bytes(v)
+                    if res:
+                        return res
+            return None
+
+        found = find_inline_bytes(response)
+        if found:
+            return found
+
+        st.warning("No image data found in response. The request may have been blocked by safety filters or the SDK returned unexpected structure.")
         return None
 
-    except Exception as e:
-        st.error(f"Error generating image: {e}")
+    except Exception:
+        st.error("Error generating image via GenAI SDK. Full traceback:")
+        st.code(traceback.format_exc())
         return None
 
 # -- HELPER FUNCTION: PROCESSING ---
 def process_and_save_images(image_bytes, index, subject, output_folder):
-    """
-    Splits the side-by-side image bytes and saves as pair.
-    """
     try:
         img = Image.open(BytesIO(image_bytes)).convert("RGBA")
 
@@ -138,26 +194,27 @@ def process_and_save_images(image_bytes, index, subject, output_folder):
         img_diff.save(diff_path)
 
         return [base_path, diff_path]
-    except Exception as e:
-        st.error(f"Error processing image: {e}")
+    except Exception:
+        st.error("Error processing image. Full traceback:")
+        st.code(traceback.format_exc())
         return None
 
 # -- STREAMLIT UI --
 st.set_page_config(page_title="Gemini 2.5 Diff Generator", layout="wide")
 
-# Sidebar: settings button + info
+# Sidebar: settings button + info + debug toggle
 with st.sidebar:
     st.header("Settings")
     if st.button("Change API Key"):
         open_settings_modal()
     if st.session_state.get("api_key"):
-        # Masked display (show only last 4 chars)
         k = st.session_state["api_key"]
         masked = "•" * max(0, len(k) - 4) + (k[-4:] if len(k) >= 4 else k)
         st.write("Current key:", masked)
     else:
         st.write("No API key set")
     st.info("Get your key at https://aistudio.google.com/")
+    st.checkbox("Enable debug mode (show raw responses & tracebacks)", value=st.session_state["debug_mode"], key="debug_mode")
 
 # Render modal if needed
 render_settings_modal()
@@ -172,7 +229,6 @@ with col1:
 with col2:
     num_pairs = st.number_input("Number of Pairs", min_value=1, max_value=50, value=1)
 
-# The rigorous difference logic
 diff_logic = """
 1. Micro-Deletions: Remove tiny functional parts (screws, buttons) or one item in a cluster.
 2. Material & Finish: Remove white shine/specular highlights on one object.
@@ -182,22 +238,43 @@ diff_logic = """
 """
 style_logic = "Old line cartoon style with bright flat colors."
 
-# Use the API key stored in session_state
 api_key = st.session_state.get("api_key", "").strip()
+
+# Diagnostic button: test API key + client creation (does not call heavy generate operations)
+if st.button("Run client diagnostic (no generation)"):
+    if not api_key:
+        st.error("Please set your Google API Key in Settings.")
+        open_settings_modal()
+        render_settings_modal()
+    else:
+        try:
+            client = genai.Client(api_key=api_key)
+            st.success("Client created successfully.")
+            if hasattr(client, "models"):
+                st.write("Client has 'models' attribute.")
+            else:
+                st.warning("Client does not expose 'models'. SDK version may differ. Show client repr below:")
+                st.code(repr(client))
+        except Exception:
+            st.error("Failed to create client. Full traceback:")
+            st.code(traceback.format_exc())
 
 if st.button("Generate Images"):
     if not api_key:
         st.error("Please set your Google API Key in Settings.")
-        # force open settings modal so user can enter it
         open_settings_modal()
         render_settings_modal()
     elif not subject_input:
         st.error("Please enter a subject.")
     else:
-        # Initialize Google GenAI Client
-        client = genai.Client(api_key=api_key)
+        client = None
+        try:
+            client = genai.Client(api_key=api_key)
+        except Exception:
+            st.error("Failed to create GenAI client. Full traceback:")
+            st.code(traceback.format_exc())
+            st.stop()
 
-        # specific folder for this run
         timestamp = int(time.time())
         temp_dir = f"temp_gen_gemini_{timestamp}"
         os.makedirs(temp_dir, exist_ok=True)
@@ -208,15 +285,14 @@ if st.button("Generate Images"):
 
         generated_files_batch = []
         batch_counter = 0
+        debug = st.session_state.get("debug_mode", False)
 
         for i in range(1, int(num_pairs) + 1):
             status_text.text(f"Generating Pair {i}/{int(num_pairs)} using Gemini 2.5 Flash...")
 
-            # Generate
-            img_bytes = generate_difference_pair_gemini(client, subject_input, style_logic, diff_logic)
+            img_bytes = generate_difference_pair_gemini(client, subject_input, style_logic, diff_logic, debug=debug)
 
             if img_bytes:
-                # Process and Split
                 files = process_and_save_images(img_bytes, i, subject_input, temp_dir)
                 if files:
                     generated_files_batch.extend(files)
@@ -229,10 +305,8 @@ if st.button("Generate Images"):
             else:
                 st.warning(f"Failed to generate pair {i} (Safety filter or Error), skipping.")
 
-            # Update Progress
             progress_bar.progress(i / int(num_pairs))
 
-            # Check for batch download (Every 10 or at the end)
             if i % 10 == 0 or i == int(num_pairs):
                 if generated_files_batch:
                     zip_buffer = BytesIO()
@@ -248,7 +322,6 @@ if st.button("Generate Images"):
                         mime="application/zip"
                     )
 
-                    # Clear batch list for next batch
                     generated_files_batch = []
                     batch_counter += 1
 
