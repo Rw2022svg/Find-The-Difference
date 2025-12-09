@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.env
+.venv/
+venv/
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+
+# App artifacts
+temp_gen_gemini_*
+*.zip
